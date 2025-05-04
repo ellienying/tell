@@ -1,29 +1,23 @@
-const { Client, GatewayIntentBits, PermissionsBitField, Partials, ChannelType } = require('discord.js');
-const dotenv = require('dotenv');
-dotenv.config();
+require('dotenv').config();
+const { Client, GatewayIntentBits, PermissionsBitField, Events } = require('discord.js');
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ],
-    partials: [Partials.Channel]
+        GatewayIntentBits.MessageContent,
+    ]
 });
 
 const JOIN_TO_CREATE_CHANNEL_ID = '1368350565678977105'; // replace this
-const createdChannels = new Map(); // VC_ID -> owner_ID
-const vcBans = new Map(); // VC_ID -> Set of banned user IDs
+const createdChannels = new Map();
+const bannedUsers = new Map();
 
-client.on('ready', () => {
-    console.log(`Logged in as ${client.user.tag}`);
-});
-
-client.on('voiceStateUpdate', async (oldState, newState) => {
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     const member = newState.member;
 
-    // === VC CREATED ===
+    // User joined the Join-to-Create VC
     if (newState.channelId === JOIN_TO_CREATE_CHANNEL_ID) {
         if ([...createdChannels.values()].includes(member.id)) return;
 
@@ -33,7 +27,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         try {
             const newChannel = await guild.channels.create({
                 name: `@${member.user.username.toLowerCase()} vc`,
-                type: ChannelType.GuildVoice,
+                type: 2,
                 parent: category?.id ?? null,
                 permissionOverwrites: [
                     {
@@ -42,21 +36,33 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
                     },
                     {
                         id: guild.id,
-                        allow: [PermissionsBitField.Flags.Connect], // UNLOCKED by default
+                        allow: [PermissionsBitField.Flags.Connect],
                     },
+                    {
+                        id: guild.roles.everyone,
+                        allow: [PermissionsBitField.Flags.Connect],
+                    }
                 ],
             });
 
             createdChannels.set(newChannel.id, member.id);
-            vcBans.set(newChannel.id, new Set());
             await member.voice.setChannel(newChannel);
 
-            // Send instructions message in VC's chat channel
-            const vcChat = newChannel.guild.channels.cache.find(ch =>
+            // Lock the VC chat for everyone except bot
+            const vcChat = guild.channels.cache.find(ch =>
                 ch.name === newChannel.name && ch.isTextBased()
             );
 
             if (vcChat) {
+                await vcChat.permissionOverwrites.edit(guild.roles.everyone, {
+                    SendMessages: false,
+                });
+
+                await vcChat.permissionOverwrites.edit(client.user.id, {
+                    SendMessages: true,
+                    ViewChannel: true,
+                });
+
                 vcChat.send(
                     `${member} VC created.\n` +
                     '> `.vc kick @user`\n' +
@@ -73,7 +79,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
     }
 
-    // === VC DELETED IF EMPTY ===
+    // Delete empty VC
     if (
         oldState.channelId &&
         createdChannels.has(oldState.channelId) &&
@@ -82,7 +88,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         try {
             await oldState.channel.delete();
             createdChannels.delete(oldState.channelId);
-            vcBans.delete(oldState.channelId);
             console.log(`Deleted empty VC: ${oldState.channel.name}`);
         } catch (err) {
             console.error('Error deleting VC:', err);
@@ -90,61 +95,67 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
 });
 
-// === COMMANDS HANDLER ===
-client.on('messageCreate', async (msg) => {
-    if (!msg.content.startsWith('.vc')) return;
-    if (!msg.member?.voice?.channel) return;
-    const vc = msg.member.voice.channel;
-    const ownerId = createdChannels.get(vc.id);
-    if (!ownerId || msg.author.id !== ownerId) {
-        return msg.reply('You are not the owner of the VC.');
-    }
+client.on(Events.MessageCreate, async message => {
+    if (!message.guild || message.author.bot) return;
 
-    const args = msg.content.split(/\s+/);
-    const command = args[1];
-    const mentioned = msg.mentions.members.first();
+    const args = message.content.trim().split(/\s+/);
+    const command = args.shift()?.toLowerCase();
 
-    switch (command) {
-        case 'kick':
-            if (!mentioned) return msg.reply('Mention a user to kick.');
-            if (mentioned.voice.channel?.id === vc.id) {
-                mentioned.voice.disconnect().catch(() => msg.reply('Failed to disconnect user.'));
-                msg.reply(`Kicked ${mentioned.user.tag}`);
-            } else {
-                msg.reply('User is not in your VC.');
-            }
-            break;
+    const userVoiceChannel = message.member.voice.channel;
+    if (!userVoiceChannel) return;
 
-        case 'ban':
-            if (!mentioned) return msg.reply('Mention a user to ban.');
-            const bans = vcBans.get(vc.id);
-            bans.add(mentioned.id);
-            await vc.permissionOverwrites.edit(mentioned.id, { Connect: false });
-            if (mentioned.voice.channel?.id === vc.id) {
-                mentioned.voice.disconnect().catch(() => msg.reply('Failed to disconnect user.'));
-            }
-            msg.reply(`Banned ${mentioned.user.tag}`);
-            break;
+    const ownerId = createdChannels.get(userVoiceChannel.id);
+    if (!ownerId || message.member.id !== ownerId) return;
 
-        case 'unban':
-            if (!mentioned) return msg.reply('Mention a user to unban.');
-            vcBans.get(vc.id).delete(mentioned.id);
-            await vc.permissionOverwrites.delete(mentioned.id);
-            msg.reply(`Unbanned ${mentioned.user.tag}`);
-            break;
+    if (command === '.vc') {
+        const subcommand = args.shift()?.toLowerCase();
 
-        case 'lock':
-            await vc.permissionOverwrites.edit(vc.guild.id, { Connect: false });
-            msg.reply('VC locked.');
-            break;
+        const target = message.mentions.members.first();
+        if (!target && ['kick', 'ban', 'unban'].includes(subcommand)) {
+            return message.reply('Please mention a user.');
+        }
 
-        case 'unlock':
-            await vc.permissionOverwrites.edit(vc.guild.id, { Connect: true });
-            msg.reply('VC unlocked.');
-            break;
+        switch (subcommand) {
+            case 'kick':
+                if (target.voice.channel?.id === userVoiceChannel.id) {
+                    target.voice.disconnect().catch(() => {});
+                    message.reply(`${target.user.tag} was kicked.`);
+                } else {
+                    message.reply(`${target.user.tag} is not in your VC.`);
+                }
+                break;
 
-        default:
-            msg.reply('Unknown `.vc` command.');
+            case 'ban':
+                bannedUsers.set(`${userVoiceChannel.id}_${target.id}`, true);
+                if (target.voice.channel?.id === userVoiceChannel.id) {
+                    target.voice.disconnect().catch(() => {});
+                }
+                await userVoiceChannel.permissionOverwrites.edit(target.id, {
+                    Connect: false,
+                });
+                message.reply(`${target.user.tag} was banned.`);
+                break;
+
+            case 'unban':
+                bannedUsers.delete(`${userVoiceChannel.id}_${target.id}`);
+                await userVoiceChannel.permissionOverwrites.delete(target.id);
+                message.reply(`${target.user.tag} was unbanned.`);
+                break;
+
+            case 'lock':
+                await userVoiceChannel.permissionOverwrites.edit(message.guild.roles.everyone, {
+                    Connect: false,
+                });
+                message.reply('VC locked.');
+                break;
+
+            case 'unlock':
+                await userVoiceChannel.permissionOverwrites.edit(message.guild.roles.everyone, {
+                    Connect: true,
+                });
+                message.reply('VC unlocked.');
+                break;
+        }
     }
 });
 
